@@ -84,6 +84,15 @@ restart disarms everything, it expires by itself, it is checked again when a
 queued K-line is about to be sent, and it is suspended during a probable
 netsplit or the warm-up after a reconnect.
 
+### Telling the people who may arm KLINE
+
+Once after start-up, Sentry sends each account in `SENTRY_KLINE_ACCOUNTS` a
+private message saying that it may use `KLINE` and how. The account name is
+used as the nick; if nobody answers to it (a 401) the message is retried every
+10 minutes until it is delivered. Who has been told is remembered in
+`kline-notified.json` next to the settings file, so a restart never messages
+anyone twice.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

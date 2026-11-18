@@ -20,6 +20,8 @@ func testBot(t *testing.T) *Bot {
 		guard:            newGuard(t.TempDir() + "/known.json"),
 		klineArmed:       map[string]time.Time{},
 		lastAlert:        map[string]time.Time{},
+		notifySent:       map[string]time.Time{},
+		notifyDone:       map[string]bool{},
 	}
 	// past the warm-up, as in a bot that has been up for a while
 	b.guard.connectedAt = time.Now().Add(-time.Hour)

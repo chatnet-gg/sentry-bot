@@ -274,6 +274,13 @@ type Bot struct {
 	nicks   map[string]*nickState
 	joins   map[string][]joinEvent // per-channel mass-join sliding windows
 	sendHook   func(string) // tests only: sees every line sent
+	// One-time "you may arm KLINE" private message to each KLINE account,
+	// retried every 10 min until delivered (no 401), remembered on disk so
+	// a restart never messages anyone twice.
+	notifyReady time.Time
+	lastNotify  time.Time
+	notifySent  map[string]time.Time
+	notifyDone  map[string]bool
 	klineArmed map[string]time.Time // lower-case channel -> expiry of the KLINE arm; never persisted, a restart disarms everything
 	lastAlert  map[string]time.Time
 	klineQueue []*pendingKline // FIFO -- see action()/finishPendingKline's own comments
@@ -303,7 +310,9 @@ func main() {
 	cfg := loadConfig()
 	channelOverrides := loadSavedSettings(&cfg)
 	b := &Bot{cfg: cfg, nicks: make(map[string]*nickState), channelOverrides: channelOverrides,
-		klineArmed: make(map[string]time.Time), lastAlert: make(map[string]time.Time)}
+		klineArmed: make(map[string]time.Time), lastAlert: make(map[string]time.Time),
+		notifySent: make(map[string]time.Time), notifyDone: make(map[string]bool)}
+	b.loadNotified()
 	b.guard = newGuard(getenv("SENTRY_KNOWN_FILE", filepath.Join(filepath.Dir(cfg.StateFile), "known-hosts.json")))
 
 	backoff := time.Second
@@ -366,7 +375,7 @@ func (b *Bot) connectAndRun() error {
 
 	return readLines(tlsConn, 5*time.Second,
 		func(line string) { b.dispatch(parseLine(line)) },
-		func() { b.checkQueueTimeout() }) // timers must not depend on incoming traffic
+		func() { b.checkQueueTimeout(); b.tickNotify(time.Now()) }) // timers must not depend on incoming traffic
 }
 
 // readLines reads IRC lines from conn, calling onLine for each. Every idle
@@ -414,6 +423,7 @@ func saslPlainPayload(account, password string) string {
 
 func (b *Bot) dispatch(l Line) {
 	b.checkQueueTimeout()
+	b.tickNotify(time.Now())
 
 	switch l.Command {
 	case "PING":
@@ -465,12 +475,18 @@ func (b *Bot) dispatch(l Line) {
 		}
 
 	case "001":
+		b.notifyReady = time.Now().Add(45 * time.Second)
 		b.send(fmt.Sprintf("OPER %s %s", b.cfg.OperNick, b.cfg.OperPassword))
 		if b.cfg.AutoJoin {
 			b.send("JOIN " + b.cfg.MainChannel)
 			log.Printf("registered, joined %s, opering up as %s", b.cfg.MainChannel, b.cfg.OperNick)
 		} else {
 			log.Printf("registered, opering up as %s; monitoring is OFF until an admin sends JOIN <#channel>", b.cfg.OperNick)
+		}
+
+	case "401": // ERR_NOSUCHNICK: an access notice did not reach anyone, retry later
+		if len(l.Params) >= 2 {
+			delete(b.notifySent, strings.ToLower(l.Params[1]))
 		}
 
 	case "381": // RPL_YOUREOPER
@@ -1617,4 +1633,77 @@ func (b *Bot) finishPendingRequest() {
 	// around #chatnet.
 	b.send(fmt.Sprintf("PRIVMSG %s :[Sentry] %s requested monitoring for %s (%d members) -- an admin can /msg %s APPROVE %s or DENY %s",
 		b.cfg.MainChannel, p.nick, p.channel, p.count, b.cfg.Nick, p.channel, p.channel))
+}
+
+// ---- one-time access notice for KLINE accounts ----------------------
+
+const klineAccessNotice = "Hi, I'm Sentry, ChatNet's anti-abuse bot. You have been given access to my KLINE command. " +
+	"If a real attack hits a channel: /msg Sentry KLINE #channel ON arms automatic network bans there " +
+	"(default 1 day, then it disarms itself; KLINE #channel OFF stops it). " +
+	"I never ban anyone on my own unless one of you arms it, and I pause during a netsplit. Send me HELP for everything else."
+
+func (b *Bot) notifiedPath() string {
+	return filepath.Join(filepath.Dir(b.cfg.StateFile), "kline-notified.json")
+}
+
+func (b *Bot) loadNotified() {
+	data, err := os.ReadFile(b.notifiedPath())
+	if err != nil {
+		return
+	}
+	var list []string
+	if json.Unmarshal(data, &list) == nil {
+		for _, a := range list {
+			b.notifyDone[strings.ToLower(a)] = true
+		}
+	}
+}
+
+func (b *Bot) saveNotified() {
+	list := make([]string, 0, len(b.notifyDone))
+	for a := range b.notifyDone {
+		list = append(list, a)
+	}
+	sort.Strings(list)
+	data, _ := json.Marshal(list)
+	tmp := b.notifiedPath() + ".tmp"
+	if os.WriteFile(tmp, data, 0o600) == nil {
+		os.Rename(tmp, b.notifiedPath())
+	}
+}
+
+// tickNotify sends the access notice to every KLINE account not yet told,
+// treating the account name as the nick. No 401 within 15 s counts as
+// delivered; otherwise it is retried every 10 minutes.
+func (b *Bot) tickNotify(now time.Time) {
+	if b.notifyReady.IsZero() || now.Before(b.notifyReady) {
+		return
+	}
+	changed := false
+	for n, t := range b.notifySent {
+		if now.Sub(t) > 15*time.Second {
+			b.notifyDone[n] = true
+			delete(b.notifySent, n)
+			changed = true
+			log.Printf("KLINE access notice delivered to %s", n)
+		}
+	}
+	if changed {
+		b.saveNotified()
+	}
+	if now.Sub(b.lastNotify) < 10*time.Minute {
+		return
+	}
+	b.lastNotify = now
+	for _, a := range b.cfg.KlineAccounts {
+		k := strings.ToLower(a)
+		if k == "" || strings.ContainsAny(a, " ,:#") || b.notifyDone[k] {
+			continue
+		}
+		if _, pending := b.notifySent[k]; pending {
+			continue
+		}
+		b.send(fmt.Sprintf("PRIVMSG %s :%s", a, klineAccessNotice))
+		b.notifySent[k] = now
+	}
 }
