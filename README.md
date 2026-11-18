@@ -44,6 +44,10 @@ While it watches, these guards keep the detections away from real users
 - **Netsplits:** nicks that quit with a split-style reason are remembered, and
   their rejoin is not counted; the netjoin also opens a short window
   (`SENTRY_NETJOIN_WINDOW_SEC`, 90 s) in which unknown hosts are not counted.
+  With `flatten_links = yes` the server writes the fixed text `*.net *.split`
+  instead of the server names, and that is recognised too. Independently of
+  the text, 8 or more known members quitting within 10 seconds (a hub reset,
+  say) is treated as a probable split: nothing is actioned for 10 minutes.
 - **Presence:** nicks already in the channel (tracked from NAMES, JOIN, PART,
   QUIT, KICK and NICK) and hosts seen for a while
   (`SENTRY_KNOWN_AFTER_SEC`, kept in `SENTRY_KNOWN_FILE` for

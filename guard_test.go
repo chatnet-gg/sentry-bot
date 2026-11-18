@@ -160,8 +160,8 @@ func TestInfrastructureNeverActioned(t *testing.T) {
 }
 
 func TestSplitReason(t *testing.T) {
-	yes := []string{"hub.chatnet.gg London.UK.EU.ChatNet.Gg", "a.b c.d"}
-	no := []string{"Quit: hub.chatnet.gg London.UK.EU.ChatNet.Gg", "Ping timeout: 240 seconds", "Read error: Connection reset by peer", "bye", "hello world", ""}
+	yes := []string{"hub.chatnet.gg London.UK.EU.ChatNet.Gg", "a.b c.d", "*.net *.split"}
+	no := []string{"Quit: *.net *.split", "*.net *.join", "*.net", "Quit: hub.chatnet.gg London.UK.EU.ChatNet.Gg", "Ping timeout: 240 seconds", "Read error: Connection reset by peer", "bye", "hello world", ""}
 	for _, r := range yes {
 		if !isSplitReason(r) {
 			t.Errorf("%q should be a split reason", r)

@@ -138,3 +138,45 @@ func TestUnarmedAlertsTarget(t *testing.T) {
 		t.Fatalf("queue=%d sent=%v", len(b.klineQueue), sent)
 	}
 }
+
+// The real text of a netsplit QUIT when serverhide flatten_links is on.
+func TestFlattenedNetsplitTextRecognised(t *testing.T) {
+	b := testBot(t)
+	arm(b, "#chatnet")
+	for i := 0; i < 200; i++ {
+		feed(b, fmt.Sprintf(":u%d!~u@host%d.example JOIN #chatnet", i, i))
+	}
+	for _, s := range b.guard.known {
+		s.First -= 3600
+	}
+	b.klineQueue = nil
+	for i := 0; i < 200; i++ {
+		feed(b, fmt.Sprintf(":u%d!~u@host%d.example QUIT :*.net *.split", i, i))
+	}
+	for i := 0; i < 200; i++ {
+		feed(b, fmt.Sprintf(":u%d!~u@host%d.example JOIN #chatnet", i, i))
+	}
+	if n := len(b.klineQueue); n != 0 {
+		t.Fatalf("netsplit rejoin queued %d K-lines even though armed, want 0", n)
+	}
+}
+
+// Whatever the QUIT text says, many members quitting at once suspends
+// action; even an armed channel must not ban the people who come back.
+func TestQuitBurstWithOddTextSuspendsAction(t *testing.T) {
+	b := testBot(t)
+	arm(b, "#chatnet")
+	for i := 0; i < 30; i++ {
+		feed(b, fmt.Sprintf(":u%d!~u@host%d.example JOIN #chatnet", i, i))
+	}
+	b.klineQueue = nil
+	for i := 0; i < 30; i++ { // hub reset: connection-reset style reasons
+		feed(b, fmt.Sprintf(":u%d!~u@host%d.example QUIT :Read error: Connection reset by peer", i, i))
+	}
+	for i := 0; i < 30; i++ {
+		feed(b, fmt.Sprintf(":n%d!~n@new%d.example JOIN #chatnet", i, i))
+	}
+	if n := len(b.klineQueue); n != 0 {
+		t.Fatalf("after a quit burst %d K-lines were queued, want 0", n)
+	}
+}

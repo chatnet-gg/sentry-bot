@@ -38,7 +38,10 @@ import (
 // solanum/cnircd netsplit QUIT reason: two server names, nothing else.
 // A user's own quit text is always prefixed "Quit: " by the ircd, so it
 // can't be forged into this shape.
-var splitReasonRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z0-9.-]+ [A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z0-9.-]+$`)
+// With serverhide flatten_links = yes the ircd writes the fixed text
+// "*.net *.split" instead of the real server names (solanum, ircd/client.c).
+// Both shapes are split reasons.
+var splitReasonRe = regexp.MustCompile(`^(\*\.net \*\.split|[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z0-9.-]+ [A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z0-9.-]+)$`)
 
 func isSplitReason(reason string) bool {
 	return splitReasonRe.MatchString(strings.TrimSpace(reason))
@@ -95,6 +98,8 @@ type guard struct {
 
 	connectedAt  time.Time
 	netjoinUntil time.Time
+	splitUntil   time.Time   // probable netsplit: no automatic action until then
+	quitTimes    []time.Time // recent QUITs of known members, for burst detection
 
 	klineTimes   []time.Time
 	breakerUntil time.Time
@@ -139,6 +144,8 @@ func (g *guard) reset(now time.Time) {
 	g.split = make(map[string]splitInfo)
 	g.connectedAt = now
 	g.netjoinUntil = time.Time{}
+	g.splitUntil = time.Time{}
+	g.quitTimes = nil
 }
 
 func (g *guard) load() {
@@ -292,17 +299,41 @@ func (g *guard) onQuit(nick, host, reason string, now time.Time) bool {
 			was = true
 		}
 	}
+	if was {
+		// Independent of the QUIT text: a burst of members quitting at once
+		// looks like a split (or a hub reset) whatever the reason says.
+		cut := now.Add(-quitBurstWindow)
+		kept := g.quitTimes[:0]
+		for _, t := range g.quitTimes {
+			if t.After(cut) {
+				kept = append(kept, t)
+			}
+		}
+		g.quitTimes = append(kept, now)
+		if len(g.quitTimes) >= quitBurstCount {
+			g.splitUntil = now.Add(splitHold)
+		}
+	}
 	if was && isSplitReason(reason) {
 		g.split[l] = splitInfo{host: host, at: now}
+		g.splitUntil = now.Add(splitHold)
 		return true
 	}
 	return false
 }
 
+// Probable-split detection: this many member QUITs within the window, or
+// any split-style QUIT, suspends every automatic action for splitHold.
+const (
+	quitBurstCount  = 8
+	quitBurstWindow = 10 * time.Second
+	splitHold       = 10 * time.Minute
+)
+
 // inSplit reports whether a netsplit, a netjoin or the warm-up after a
 // (re)connect is probably in progress, so nobody must be actioned.
 func (g *guard) inSplit(now time.Time) bool {
-	return now.Before(g.netjoinUntil) || now.Sub(g.connectedAt) < g.warmup
+	return now.Before(g.splitUntil) || now.Before(g.netjoinUntil) || now.Sub(g.connectedAt) < g.warmup
 }
 
 // classifyJoin updates presence for a JOIN into a monitored channel and
