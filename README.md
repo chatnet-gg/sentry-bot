@@ -93,6 +93,13 @@ used as the nick; if nobody answers to it (a 401) the message is retried every
 `kline-notified.json` next to the settings file, so a restart never messages
 anyone twice.
 
+## Channels to join at start-up
+
+`SENTRY_AUTOJOIN_CHANNELS` is a comma-separated list of channels that Sentry
+joins and monitors on every (re)connect, so that an admin does not have to send
+`JOIN` after each restart. Being in a channel never bans anyone: KLINE is still
+disarmed there until a person arms it (see above).
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

@@ -82,6 +82,9 @@ type Config struct {
 	KlineArmMinutes int    // default and maximum arm duration, minutes (default 1 day)
 	AlertTarget     string // nick or channel that gets NOTICEs about blocked/armed actions
 	StaffExemptPattern string
+	// Channels joined and monitored on every (re)connect. KLINE stays
+	// disarmed everywhere until a person arms it, so being present is harmless.
+	AutoJoinChannels   []string
 	AutoJoin           bool // join+monitor MainChannel on connect; default OFF, an admin turns it on from IRC (JOIN)
 
 	FloodPermit    int
@@ -124,6 +127,7 @@ func loadConfig() Config {
 		// prefix match done by exemptPrefix().
 		StaffExemptPattern: getenv("SENTRY_STAFF_EXEMPT_PATTERN", "chatnet/staff,chatnet/service/,chatnet/bot/"),
 		AutoJoin:           getenv("SENTRY_AUTOJOIN", "") == "1",
+		AutoJoinChannels:   splitCommaList(getenv("SENTRY_AUTOJOIN_CHANNELS", "")),
 
 		FloodPermit:    getenvInt("SENTRY_FLOOD_PERMIT", 30),
 		FloodWindow:    time.Duration(getenvInt("SENTRY_FLOOD_WINDOW_SEC", 40)) * time.Second,
@@ -359,6 +363,11 @@ func (b *Bot) connectAndRun() error {
 	if b.cfg.AutoJoin {
 		b.channels[b.cfg.MainChannel] = true
 	}
+	for _, c := range b.cfg.AutoJoinChannels {
+		if channelNameRe.MatchString(c) {
+			b.channels[c] = true
+		}
+	}
 	b.guard.reset(time.Now())
 	b.saslDone = false
 
@@ -477,6 +486,12 @@ func (b *Bot) dispatch(l Line) {
 	case "001":
 		b.notifyReady = time.Now().Add(45 * time.Second)
 		b.send(fmt.Sprintf("OPER %s %s", b.cfg.OperNick, b.cfg.OperPassword))
+		for _, c := range b.cfg.AutoJoinChannels {
+			if channelNameRe.MatchString(c) && !(b.cfg.AutoJoin && strings.EqualFold(c, b.cfg.MainChannel)) {
+				b.send("JOIN " + c)
+				log.Printf("auto-joined %s (SENTRY_AUTOJOIN_CHANNELS), KLINE disarmed until a person arms it", c)
+			}
+		}
 		if b.cfg.AutoJoin {
 			b.send("JOIN " + b.cfg.MainChannel)
 			log.Printf("registered, joined %s, opering up as %s", b.cfg.MainChannel, b.cfg.OperNick)
