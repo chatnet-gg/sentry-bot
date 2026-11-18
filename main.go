@@ -53,6 +53,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -75,6 +76,7 @@ type Config struct {
 	MainChannel      string
 	AdminAccounts    []string
 	StaffExemptPattern string
+	AutoJoin           bool // join+monitor MainChannel on connect; default OFF, an admin turns it on from IRC (JOIN)
 
 	FloodPermit    int
 	FloodWindow    time.Duration
@@ -108,11 +110,11 @@ func loadConfig() Config {
 		// admin-only commands. Still WHOIS-verified per account, same as
 		// a single admin -- see isAdmin().
 		AdminAccounts: splitCommaList(getenv("SENTRY_ADMIN_ACCOUNTS", "abcX")),
-		// Stored as just the host-prefix part -- the "*@" prefix and
-		// trailing "*" of a full mask are implicit in the
-		// strings.HasPrefix check in action() itself, not part of this
-		// value.
-		StaffExemptPattern: getenv("SENTRY_STAFF_EXEMPT_PATTERN", "chatnet/staff"),
+		// Comma-separated host prefixes (e.g. "chatnet/staff"); stored without
+		// the "*@" and trailing "*" of a full mask, which are implicit in the
+		// prefix match done by exemptPrefix().
+		StaffExemptPattern: getenv("SENTRY_STAFF_EXEMPT_PATTERN", "chatnet/staff,chatnet/service/,chatnet/bot/"),
+		AutoJoin:           getenv("SENTRY_AUTOJOIN", "") == "1",
 
 		FloodPermit:    getenvInt("SENTRY_FLOOD_PERMIT", 30),
 		FloodWindow:    time.Duration(getenvInt("SENTRY_FLOOD_WINDOW_SEC", 40)) * time.Second,
@@ -267,12 +269,15 @@ type Bot struct {
 	channelOverrides map[string]map[string]string
 
 	saslDone bool
+
+	guard *guard // netsplit/presence/infra guards, see guard.go
 }
 
 func main() {
 	cfg := loadConfig()
 	channelOverrides := loadSavedSettings(&cfg)
 	b := &Bot{cfg: cfg, nicks: make(map[string]*nickState), channelOverrides: channelOverrides}
+	b.guard = newGuard(getenv("SENTRY_KNOWN_FILE", filepath.Join(filepath.Dir(cfg.StateFile), "known-hosts.json")))
 
 	backoff := time.Second
 	for {
@@ -314,7 +319,11 @@ func (b *Bot) connectAndRun() error {
 	// Reset to just the configured main channel on every (re)connect --
 	// extra channels added via JOIN/APPROVE are deliberately in-memory
 	// only, see this file's own top comment.
-	b.channels = map[string]bool{b.cfg.MainChannel: true}
+	b.channels = map[string]bool{}
+	if b.cfg.AutoJoin {
+		b.channels[b.cfg.MainChannel] = true
+	}
+	b.guard.reset(time.Now())
 	b.saslDone = false
 
 	// SASL PLAIN, pre-registration -- see project memory
@@ -368,14 +377,22 @@ func (b *Bot) dispatch(l Line) {
 		}
 		switch strings.ToUpper(l.Params[1]) {
 		case "LS":
-			if strings.Contains(l.Trailing, "sasl") {
-				b.send("CAP REQ :sasl")
+			var want []string
+			for _, c := range []string{"sasl", "userhost-in-names"} {
+				if strings.Contains(l.Trailing, c) {
+					want = append(want, c)
+				}
+			}
+			if len(want) > 0 {
+				b.send("CAP REQ :" + strings.Join(want, " "))
 			} else {
 				b.send("CAP END")
 			}
 		case "ACK":
 			if strings.Contains(l.Trailing, "sasl") {
 				b.send("AUTHENTICATE PLAIN")
+			} else {
+				b.send("CAP END")
 			}
 		case "NAK":
 			b.send("CAP END")
@@ -401,8 +418,12 @@ func (b *Bot) dispatch(l Line) {
 
 	case "001":
 		b.send(fmt.Sprintf("OPER %s %s", b.cfg.OperNick, b.cfg.OperPassword))
-		b.send("JOIN " + b.cfg.MainChannel)
-		log.Printf("registered, joined %s, opering up as %s", b.cfg.MainChannel, b.cfg.OperNick)
+		if b.cfg.AutoJoin {
+			b.send("JOIN " + b.cfg.MainChannel)
+			log.Printf("registered, joined %s, opering up as %s", b.cfg.MainChannel, b.cfg.OperNick)
+		} else {
+			log.Printf("registered, opering up as %s; monitoring is OFF until an admin sends JOIN <#channel>", b.cfg.OperNick)
+		}
 
 	case "381": // RPL_YOUREOPER
 		log.Printf("oper-up succeeded")
@@ -442,6 +463,9 @@ func (b *Bot) dispatch(l Line) {
 		if b.pendingReq != nil && len(l.Params) >= 3 && strings.EqualFold(l.Params[2], b.pendingReq.channel) {
 			b.pendingReq.count += len(strings.Fields(l.Trailing))
 		}
+		if len(l.Params) >= 3 && b.channels[l.Params[2]] {
+			b.guard.onNames(l.Params[2], l.Trailing, time.Now())
+		}
 
 	case "366": // RPL_ENDOFNAMES
 		if b.pendingReq != nil && len(l.Params) >= 2 && strings.EqualFold(l.Params[1], b.pendingReq.channel) {
@@ -457,6 +481,26 @@ func (b *Bot) dispatch(l Line) {
 	case "PART":
 		if b.channels[l.target()] {
 			b.recordJoinPartCycle(l.Nick, l.Host, l.target())
+			b.guard.removeMember(l.target(), l.Nick)
+		}
+
+	case "KICK":
+		if b.channels[l.target()] && len(l.Params) >= 2 {
+			b.guard.removeMember(l.target(), l.Params[1])
+		}
+
+	case "NICK":
+		newNick := l.Trailing
+		if newNick == "" && len(l.Params) > 0 {
+			newNick = l.Params[0]
+		}
+		if newNick != "" {
+			b.guard.renameMember(l.Nick, newNick)
+		}
+
+	case "QUIT":
+		if b.guard.onQuit(l.Nick, l.Host, l.Trailing, time.Now()) {
+			log.Printf("netsplit QUIT: %s (%s)", l.Nick, l.Trailing)
 		}
 
 	case "PRIVMSG":
@@ -486,6 +530,13 @@ func (b *Bot) getState(nick string) *nickState {
 // up and drains via the WHOIS queue instead of mostly being ignored.
 func (b *Bot) recordJoin(l Line) {
 	chan_ := l.target()
+	if strings.EqualFold(l.Nick, b.cfg.Nick) {
+		return
+	}
+	if why := b.guard.classifyJoin(chan_, l.Nick, l.Host, time.Now()); why != "" {
+		log.Printf("JOIN %s %s (%s): not counted toward mass-join -- %s", chan_, l.Nick, l.Host, why)
+		return
+	}
 	ec := b.effectiveConfig(chan_)
 	now := time.Now()
 	events := append(b.joins[chan_], joinEvent{at: now, nick: l.Nick, host: l.Host})
@@ -620,9 +671,29 @@ func (b *Bot) recordMessage(l Line) {
 // klineQueue/processKlineQueue below, which processes every queued
 // nick one at a time (each needs its own WHOIS round-trip to resolve a
 // real host) instead of losing all but the first.
+// exemptPrefix returns the entry of patterns (comma-separated host
+// prefixes, e.g. "chatnet/staff,chatnet/service/") that host starts
+// with, or "" if none. Services that print many lines at once (art or game services)
+// by design, so their chatnet/service/* cloak is exempt alongside staff.
+func exemptPrefix(host, patterns string) string {
+	h := strings.ToLower(host)
+	for _, p := range strings.Split(patterns, ",") {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p != "" && strings.HasPrefix(h, p) {
+			return p
+		}
+	}
+	return ""
+}
+
 func (b *Bot) action(nick, host, reason string) {
-	if b.cfg.StaffExemptPattern != "" && strings.HasPrefix(strings.ToLower(host), strings.ToLower(b.cfg.StaffExemptPattern)) {
-		log.Printf("EXEMPT: %s (%s) matched staff pattern %q, not actioning -- %s", nick, host, b.cfg.StaffExemptPattern, reason)
+	if p := exemptPrefix(host, b.cfg.StaffExemptPattern); p != "" {
+		log.Printf("EXEMPT: %s (%s) matched staff pattern %q, not actioning -- %s", nick, host, p, reason)
+		return
+	}
+
+	if isInfraHost(host, b.guard.infraSufx, b.guard.infraIPs) {
+		log.Printf("EXEMPT: %s (%s) is ChatNet infrastructure, not actioning -- %s", nick, host, reason)
 		return
 	}
 
@@ -663,8 +734,17 @@ func (b *Bot) finishPendingKline(host string) {
 	b.klineQueue = b.klineQueue[1:]
 
 	mask := "*@" + host
-	log.Printf("KLINE %s (%s) -- %s (queue depth now %d)", mask, p.nick, p.reason, len(b.klineQueue))
-	b.send(fmt.Sprintf("KLINE %d %s :%s|%s", b.cfg.KlineDurationMin, mask, b.cfg.KlineMessage, p.reason))
+	switch {
+	case isInfraHost(host, b.guard.infraSufx, b.guard.infraIPs):
+		log.Printf("SKIP KLINE %s (%s): real host is ChatNet infrastructure -- %s", mask, p.nick, p.reason)
+	case !b.guard.allowKline(time.Now()):
+		log.Printf("SKIP KLINE %s (%s): circuit breaker open, dropping the %d queued -- %s", mask, p.nick, len(b.klineQueue), p.reason)
+		b.klineQueue = nil
+		return
+	default:
+		log.Printf("KLINE %s (%s) -- %s (queue depth now %d)", mask, p.nick, p.reason, len(b.klineQueue))
+		b.send(fmt.Sprintf("KLINE %d %s :%s|%s", b.cfg.KlineDurationMin, mask, b.cfg.KlineMessage, p.reason))
+	}
 
 	if len(b.klineQueue) > 0 {
 		b.send("WHOIS " + b.klineQueue[0].nick)
@@ -727,7 +807,7 @@ func (b *Bot) handlePrivate(nick, text string) {
 // helpLines is public info, no WHOIS gate -- unlike every actual command
 // above, there's nothing sensitive in just describing what they do.
 var helpLines = []string{
-	"Sentry -- ChatNet's anti-abuse bot. Watches its monitored channels for message flood, repeated messages, and mass-join (clone-army) patterns, and issues a temporary KLINE against the real offending host when one fires.",
+	"Sentry -- ChatNet's anti-abuse bot. It is OFF by default: it watches a channel only after an admin sends JOIN <#channel>, and stops on PART. While watching, it checks for message flood, repeated messages, and mass-join (clone-army) patterns, and issues a temporary KLINE against the real offending host when one fires.",
 	"Commands (all via /msg Sentry <command>):",
 	"  REQUEST <#channel> -- ask Sentry to start monitoring a channel (needs 10+ members, then waits on admin approval). Anyone can use this.",
 	"  HELP -- this message.",
@@ -796,12 +876,13 @@ func (b *Bot) finishPendingCmd() {
 		b.send(fmt.Sprintf("NOTICE %s :Joined and now monitoring %s.", p.nick, p.channel))
 
 	case "PART":
-		if !b.channels[p.channel] || strings.EqualFold(p.channel, b.cfg.MainChannel) {
-			b.send(fmt.Sprintf("NOTICE %s :Not monitoring %s (or it's the configured main channel, won't part that one).", p.nick, p.channel))
+		if !b.channels[p.channel] || (b.cfg.AutoJoin && strings.EqualFold(p.channel, b.cfg.MainChannel)) {
+			b.send(fmt.Sprintf("NOTICE %s :Not monitoring %s (or it's the auto-joined main channel, won't part that one).", p.nick, p.channel))
 			return
 		}
 		delete(b.channels, p.channel)
 		delete(b.joins, p.channel)
+		b.guard.forgetChannel(p.channel)
 		b.send("PART " + p.channel)
 		log.Printf("PART %s requested by %s (account %s)", p.channel, p.nick, p.account)
 		b.send(fmt.Sprintf("NOTICE %s :Left and stopped monitoring %s.", p.nick, p.channel))
