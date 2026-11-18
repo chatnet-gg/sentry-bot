@@ -46,6 +46,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -363,17 +364,35 @@ func (b *Bot) connectAndRun() error {
 	b.send("USER " + b.cfg.Nick + " 0 * :ChatNet anti-abuse bot")
 	log.Printf("connecting to %s as %s", addr, b.cfg.Nick)
 
-	reader := bufio.NewReader(tlsConn)
+	return readLines(tlsConn, 5*time.Second,
+		func(line string) { b.dispatch(parseLine(line)) },
+		func() { b.checkQueueTimeout() }) // timers must not depend on incoming traffic
+}
+
+// readLines reads IRC lines from conn, calling onLine for each. Every idle
+// period without data it calls onIdle, so time-based work (the queued-KLINE
+// timeout) runs even when the server is silent. A line split across an idle
+// timeout is kept, not dropped.
+func readLines(conn net.Conn, idle time.Duration, onLine func(string), onIdle func()) error {
+	reader := bufio.NewReader(conn)
+	partial := ""
 	for {
-		line, err := reader.ReadString('\n')
+		conn.SetReadDeadline(time.Now().Add(idle))
+		chunk, err := reader.ReadString('\n')
+		partial += chunk
 		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				onIdle()
+				continue
+			}
 			return fmt.Errorf("read: %w", err)
 		}
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" {
-			continue
+		line := strings.TrimRight(partial, "\r\n")
+		partial = ""
+		if line != "" {
+			onLine(line)
 		}
-		b.dispatch(parseLine(line))
 	}
 }
 
