@@ -59,6 +59,27 @@ While it watches, these guards keep the detections away from real users
 
 `go test ./...` covers each of these, including a 200-user netsplit rejoin.
 
+## KLINE only when a person arms it
+
+Detections are never allowed to ban by themselves. By default a flood,
+repeat or mass-join detection only logs a line and, if `SENTRY_ALERT_TARGET`
+is set (a nick or a channel), sends a short NOTICE saying that nobody was
+banned and how to arm the channel.
+
+A person arms KLINE for one channel by private message (WHOIS-verified, like
+every command):
+
+- `KLINE <#channel> ON [minutes]` -- arm it (joins the channel if needed).
+  The default and maximum duration is `SENTRY_KLINE_ARM_MINUTES` (1 day).
+- `KLINE <#channel> OFF` -- disarm it. `KLINE <#channel> STATUS` shows the
+  state, and `KLINE` alone lists the armed channels.
+
+Admins can always arm; `SENTRY_KLINE_ACCOUNTS` (comma-separated accounts) adds
+people who may arm but are not admins. The arm is **never persisted**, so a
+restart disarms everything, it expires by itself, it is checked again when a
+queued K-line is about to be sent, and it is suspended during a probable
+netsplit or the warm-up after a reconnect.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

@@ -299,6 +299,12 @@ func (g *guard) onQuit(nick, host, reason string, now time.Time) bool {
 	return false
 }
 
+// inSplit reports whether a netsplit, a netjoin or the warm-up after a
+// (re)connect is probably in progress, so nobody must be actioned.
+func (g *guard) inSplit(now time.Time) bool {
+	return now.Before(g.netjoinUntil) || now.Sub(g.connectedAt) < g.warmup
+}
+
 // classifyJoin updates presence for a JOIN into a monitored channel and
 // returns "" if it should count toward the mass-join window, or the reason
 // it must not.

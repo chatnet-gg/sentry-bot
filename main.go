@@ -75,6 +75,11 @@ type Config struct {
 	OperPassword     string
 	MainChannel      string
 	AdminAccounts    []string
+	// Accounts allowed to arm KLINE on a channel (KLINE <#chan> ON).
+	// Defaults to AdminAccounts; WHOIS-verified like every command.
+	KlineAccounts   []string
+	KlineArmMinutes int    // default and maximum arm duration, minutes (default 1 day)
+	AlertTarget     string // nick or channel that gets NOTICEs about blocked/armed actions
 	StaffExemptPattern string
 	AutoJoin           bool // join+monitor MainChannel on connect; default OFF, an admin turns it on from IRC (JOIN)
 
@@ -110,6 +115,9 @@ func loadConfig() Config {
 		// admin-only commands. Still WHOIS-verified per account, same as
 		// a single admin -- see isAdmin().
 		AdminAccounts: splitCommaList(getenv("SENTRY_ADMIN_ACCOUNTS", "abcX")),
+		KlineAccounts:   splitCommaList(getenv("SENTRY_KLINE_ACCOUNTS", "")),
+		KlineArmMinutes: getenvInt("SENTRY_KLINE_ARM_MINUTES", 1440),
+		AlertTarget:     getenv("SENTRY_ALERT_TARGET", ""),
 		// Comma-separated host prefixes (e.g. "chatnet/staff"); stored without
 		// the "*@" and trailing "*" of a full mask, which are implicit in the
 		// prefix match done by exemptPrefix().
@@ -179,6 +187,19 @@ func splitCommaList(s string) []string {
 	return out
 }
 
+// canKline: may this account arm KLINE? Admins always, plus KlineAccounts.
+func (cfg Config) canKline(account string) bool {
+	if cfg.isAdmin(account) {
+		return true
+	}
+	for _, a := range cfg.KlineAccounts {
+		if strings.EqualFold(a, account) {
+			return true
+		}
+	}
+	return false
+}
+
 func (cfg Config) isAdmin(account string) bool {
 	for _, a := range cfg.AdminAccounts {
 		if strings.EqualFold(a, account) {
@@ -216,6 +237,7 @@ type pendingKline struct {
 	nick      string
 	reason    string
 	fallback  string // the cloaked host, used only if 378 never arrives
+	channel   string // where it was detected; KLINE must still be armed there when it is issued
 	createdAt time.Time
 }
 
@@ -250,6 +272,9 @@ type Bot struct {
 	conn    net.Conn
 	nicks   map[string]*nickState
 	joins   map[string][]joinEvent // per-channel mass-join sliding windows
+	sendHook   func(string) // tests only: sees every line sent
+	klineArmed map[string]time.Time // lower-case channel -> expiry of the KLINE arm; never persisted, a restart disarms everything
+	lastAlert  map[string]time.Time
 	klineQueue []*pendingKline // FIFO -- see action()/finishPendingKline's own comments
 
 	channels   map[string]bool // currently-monitored channels
@@ -276,7 +301,8 @@ type Bot struct {
 func main() {
 	cfg := loadConfig()
 	channelOverrides := loadSavedSettings(&cfg)
-	b := &Bot{cfg: cfg, nicks: make(map[string]*nickState), channelOverrides: channelOverrides}
+	b := &Bot{cfg: cfg, nicks: make(map[string]*nickState), channelOverrides: channelOverrides,
+		klineArmed: make(map[string]time.Time), lastAlert: make(map[string]time.Time)}
 	b.guard = newGuard(getenv("SENTRY_KNOWN_FILE", filepath.Join(filepath.Dir(cfg.StateFile), "known-hosts.json")))
 
 	backoff := time.Second
@@ -352,6 +378,9 @@ func (b *Bot) connectAndRun() error {
 }
 
 func (b *Bot) send(s string) {
+	if b.sendHook != nil {
+		b.sendHook(s)
+	}
 	if b.conn == nil {
 		return
 	}
@@ -553,7 +582,7 @@ func (b *Bot) recordJoin(l Line) {
 		log.Printf("MASSJOIN in %s: %d joins in %s (permit %d), actioning all %d",
 			chan_, len(pruned), ec.MassJoinWindow, ec.MassJoinPermit, len(pruned))
 		for _, e := range pruned {
-			b.action(e.nick, e.host, "mass-join detected in "+chan_)
+			b.action(e.nick, e.host, "mass-join detected in "+chan_, chan_)
 		}
 		b.joins[chan_] = nil
 	}
@@ -588,7 +617,7 @@ func (b *Bot) recordJoinPartCycle(nick, host, channel string) {
 	if len(pruned) > ec.JoinPartPermit {
 		log.Printf("JOINPART: %s cycled %d join/part events in %s (permit %d)",
 			nick, len(pruned), ec.JoinPartWindow, ec.JoinPartPermit)
-		b.action(nick, host, "join/part flood detected")
+		b.action(nick, host, "join/part flood detected", channel)
 		st.joinPartTimes = nil
 	}
 }
@@ -615,7 +644,7 @@ func (b *Bot) recordMessage(l Line) {
 
 	if len(st.msgTimes) > ec.FloodPermit {
 		log.Printf("FLOOD: %s sent %d lines in %s (permit %d)", l.Nick, len(st.msgTimes), ec.FloodWindow, ec.FloodPermit)
-		b.action(l.Nick, l.Host, "message flood detected")
+		b.action(l.Nick, l.Host, "message flood detected", l.target())
 		st.msgTimes = nil
 		st.repeatCount = 0
 		return
@@ -634,7 +663,7 @@ func (b *Bot) recordMessage(l Line) {
 
 	if st.repeatCount >= ec.RepeatPermit {
 		log.Printf("REPEAT: %s repeated the same line %d times in %s", l.Nick, st.repeatCount, ec.RepeatWindow)
-		b.action(l.Nick, l.Host, "repeated message detected")
+		b.action(l.Nick, l.Host, "repeated message detected", l.target())
 		st.repeatCount = 0
 	}
 }
@@ -686,7 +715,37 @@ func exemptPrefix(host, patterns string) string {
 	return ""
 }
 
-func (b *Bot) action(nick, host, reason string) {
+// klineBlocked returns "" if an automatic network ban is allowed for a
+// detection in channel, else why not. A KLINE only happens in a channel
+// that a person armed with KLINE <#chan> ON, never during a probable
+// netsplit, and never after the arm expired. Detections that are not
+// allowed to ban are logged and alerted instead.
+func (b *Bot) klineBlocked(channel string, now time.Time) string {
+	until, ok := b.klineArmed[strings.ToLower(channel)]
+	switch {
+	case !ok:
+		return "KLINE not armed for " + channel
+	case !now.Before(until):
+		delete(b.klineArmed, strings.ToLower(channel))
+		return "KLINE arm for " + channel + " expired"
+	case b.guard.inSplit(now):
+		return "probable netsplit / warm-up"
+	}
+	return ""
+}
+
+// alert logs and, if SENTRY_ALERT_TARGET is set, sends a short NOTICE
+// (at most one per key per minute).
+func (b *Bot) alert(key, msg string) {
+	log.Printf("ALERT: %s", msg)
+	if b.cfg.AlertTarget == "" || time.Since(b.lastAlert[key]) < time.Minute {
+		return
+	}
+	b.lastAlert[key] = time.Now()
+	b.send(fmt.Sprintf("NOTICE %s :[Sentry] %s", b.cfg.AlertTarget, msg))
+}
+
+func (b *Bot) action(nick, host, reason, channel string) {
 	if p := exemptPrefix(host, b.cfg.StaffExemptPattern); p != "" {
 		log.Printf("EXEMPT: %s (%s) matched staff pattern %q, not actioning -- %s", nick, host, p, reason)
 		return
@@ -694,6 +753,12 @@ func (b *Bot) action(nick, host, reason string) {
 
 	if isInfraHost(host, b.guard.infraSufx, b.guard.infraIPs) {
 		log.Printf("EXEMPT: %s (%s) is ChatNet infrastructure, not actioning -- %s", nick, host, reason)
+		return
+	}
+
+	if why := b.klineBlocked(channel, time.Now()); why != "" {
+		log.Printf("NO-KLINE (%s): %s (%s) -- %s", why, nick, host, reason)
+		b.alert("blocked:"+strings.ToLower(channel), fmt.Sprintf("%s in %s: %s (%s) -- NOT banned (%s). A staff member can arm it: /msg Sentry KLINE %s ON", reason, channel, nick, host, why, channel))
 		return
 	}
 
@@ -710,7 +775,7 @@ func (b *Bot) action(nick, host, reason string) {
 			return
 		}
 	}
-	b.klineQueue = append(b.klineQueue, &pendingKline{nick: nick, reason: reason, fallback: host, createdAt: time.Now()})
+	b.klineQueue = append(b.klineQueue, &pendingKline{nick: nick, reason: reason, fallback: host, channel: channel, createdAt: time.Now()})
 	log.Printf("QUEUED kline for %s (%s) -- %s (queue depth now %d)", nick, host, reason, len(b.klineQueue))
 	if len(b.klineQueue) == 1 {
 		// Nothing else in flight -- start processing immediately. If the
@@ -735,6 +800,8 @@ func (b *Bot) finishPendingKline(host string) {
 
 	mask := "*@" + host
 	switch {
+	case b.klineBlocked(p.channel, time.Now()) != "":
+		log.Printf("SKIP KLINE %s (%s): %s -- %s", mask, p.nick, b.klineBlocked(p.channel, time.Now()), p.reason)
 	case isInfraHost(host, b.guard.infraSufx, b.guard.infraIPs):
 		log.Printf("SKIP KLINE %s (%s): real host is ChatNet infrastructure -- %s", mask, p.nick, p.reason)
 	case !b.guard.allowKline(time.Now()):
@@ -787,6 +854,8 @@ func (b *Bot) handlePrivate(nick, text string) {
 		b.startPendingCmd(nick, "APPROVE", fields[1:])
 	case strings.EqualFold(fields[0], "DENY"):
 		b.startPendingCmd(nick, "DENY", fields[1:])
+	case strings.EqualFold(fields[0], "KLINE"):
+		b.handleKlineCmd(nick, fields[1:])
 	case strings.EqualFold(fields[0], "REQUEST"):
 		b.handleRequest(nick, fields[1:])
 	case strings.EqualFold(fields[0], "SET"):
@@ -814,6 +883,7 @@ var helpLines = []string{
 	"Admin-only (WHOIS-verified):",
 	"  JOIN <#channel> / PART <#channel> -- start/stop monitoring a channel immediately.",
 	"  CHANNELS -- list channels currently being monitored.",
+	"  KLINE <#channel> ON [minutes] / OFF / STATUS -- (admins and SENTRY_KLINE_ACCOUNTS) arm or disarm automatic KLINE for a channel, joining it if needed. Off by default, never persisted, expires by itself, paused during a probable netsplit. Without arming, detections only log and alert. KLINE alone lists the armed channels.",
 	"  APPROVE <#channel> / DENY <#channel> -- resolve a pending REQUEST.",
 	"  SETTINGS -- show current thresholds/durations.",
 	"  SET <key> <value> -- change one live, no restart, persisted to disk (survives a restart). Keys: FLOOD_PERMIT, FLOOD_WINDOW, MASSJOIN_PERMIT, MASSJOIN_WINDOW, REPEAT_PERMIT, REPEAT_WINDOW, JOINPART_PERMIT, JOINPART_WINDOW, KLINE_MINUTES, KLINE_MESSAGE, MIN_CHANNEL_SIZE, STAFF_EXEMPT_PATTERN. WINDOW values are seconds.",
@@ -858,6 +928,10 @@ func (b *Bot) finishPendingCmd() {
 	p := b.pendingCmd
 	b.pendingCmd = nil
 
+	if p.kind == "KLINE" {
+		b.finishKlineCmd(p)
+		return
+	}
 	if !b.cfg.isAdmin(p.account) {
 		log.Printf("%s denied: %s is not one of %v (account seen: %q)", p.kind, p.nick, b.cfg.AdminAccounts, p.account)
 		b.send(fmt.Sprintf("NOTICE %s :Do I know you?", p.nick))
@@ -1312,6 +1386,93 @@ func loadSavedSettings(cfg *Config) map[string]map[string]string {
 // here -- that only ever runs after the WHOIS gate confirms an admin,
 // in finishPendingCmd's own "SET" case. Applying it here too would let
 // anyone change live thresholds just by typing SET, gate or no gate.
+// handleKlineCmd: KLINE [<#channel> ON [minutes] | OFF | STATUS].
+// Validated first, acted on only after the WHOIS confirms the account.
+func (b *Bot) handleKlineCmd(nick string, args []string) {
+	if len(args) == 0 {
+		args = []string{"LIST"}
+	}
+	channel, setValue := "", ""
+	if strings.ToUpper(args[0]) != "LIST" {
+		if len(args) < 2 || !channelNameRe.MatchString(args[0]) {
+			b.send(fmt.Sprintf("NOTICE %s :Syntax: KLINE <#channel> ON [minutes] | OFF | STATUS   (or just KLINE to list)", nick))
+			return
+		}
+		channel = args[0]
+		setValue = strings.ToUpper(args[1])
+		if setValue != "ON" && setValue != "OFF" && setValue != "STATUS" {
+			b.send(fmt.Sprintf("NOTICE %s :Syntax: KLINE <#channel> ON [minutes] | OFF | STATUS", nick))
+			return
+		}
+		if setValue == "ON" && len(args) > 2 {
+			setValue = "ON " + args[2]
+		}
+	}
+	if b.pendingCmd != nil && time.Since(b.pendingCmd.createdAt) < 30*time.Second {
+		b.send(fmt.Sprintf("NOTICE %s :Already processing a request, try again shortly.", nick))
+		return
+	}
+	b.pendingCmd = &pendingChanCmd{nick: nick, kind: "KLINE", channel: channel, setValue: setValue, createdAt: time.Now()}
+	b.send("WHOIS " + nick)
+}
+
+func (b *Bot) finishKlineCmd(p *pendingChanCmd) {
+	if !b.cfg.canKline(p.account) {
+		log.Printf("KLINE denied: %s (account seen: %q)", p.nick, p.account)
+		b.send(fmt.Sprintf("NOTICE %s :Do I know you?", p.nick))
+		return
+	}
+	now := time.Now()
+	reply := func(f string, a ...interface{}) { b.send(fmt.Sprintf("NOTICE %s :%s", p.nick, fmt.Sprintf(f, a...))) }
+	if p.channel == "" { // list
+		n := 0
+		for ch, until := range b.klineArmed {
+			if now.Before(until) {
+				reply("%s armed for another %s", ch, until.Sub(now).Round(time.Minute))
+				n++
+			}
+		}
+		if n == 0 {
+			reply("KLINE is not armed on any channel.")
+		}
+		return
+	}
+	key := strings.ToLower(p.channel)
+	fields := strings.Fields(p.setValue)
+	switch fields[0] {
+	case "STATUS":
+		if until, ok := b.klineArmed[key]; ok && now.Before(until) {
+			reply("KLINE ARMED on %s for another %s.", p.channel, until.Sub(now).Round(time.Minute))
+		} else {
+			reply("KLINE not armed on %s (detections only alert).", p.channel)
+		}
+	case "OFF":
+		delete(b.klineArmed, key)
+		log.Printf("KLINE OFF %s by %s (account %s)", p.channel, p.nick, p.account)
+		reply("KLINE disarmed on %s.", p.channel)
+		b.alert("arm:"+key, fmt.Sprintf("KLINE disarmed on %s by %s", p.channel, p.nick))
+	case "ON":
+		mins := b.cfg.KlineArmMinutes
+		if len(fields) > 1 {
+			m, err := strconv.Atoi(fields[1])
+			if err != nil || m < 1 || m > b.cfg.KlineArmMinutes {
+				reply("Minutes must be 1-%d.", b.cfg.KlineArmMinutes)
+				return
+			}
+			mins = m
+		}
+		if !b.channels[p.channel] {
+			b.channels[p.channel] = true
+			b.send("JOIN " + p.channel)
+			log.Printf("JOIN %s via KLINE ON by %s (account %s)", p.channel, p.nick, p.account)
+		}
+		b.klineArmed[key] = now.Add(time.Duration(mins) * time.Minute)
+		log.Printf("KLINE ON %s for %d min by %s (account %s)", p.channel, mins, p.nick, p.account)
+		reply("KLINE ARMED on %s for %d min. Off with: KLINE %s OFF. Paused automatically during a probable netsplit.", p.channel, mins, p.channel)
+		b.alert("arm:"+key, fmt.Sprintf("KLINE armed on %s for %d min by %s", p.channel, mins, p.nick))
+	}
+}
+
 func (b *Bot) handleSet(nick string, args []string) {
 	if len(args) < 2 {
 		b.send(fmt.Sprintf("NOTICE %s :Syntax: SET <key> <value> -- see HELP for the key list.", nick))

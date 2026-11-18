@@ -18,11 +18,16 @@ func testBot(t *testing.T) *Bot {
 		channels:         map[string]bool{"#chatnet": true},
 		channelOverrides: map[string]map[string]string{},
 		guard:            newGuard(t.TempDir() + "/known.json"),
+		klineArmed:       map[string]time.Time{},
+		lastAlert:        map[string]time.Time{},
 	}
 	// past the warm-up, as in a bot that has been up for a while
 	b.guard.connectedAt = time.Now().Add(-time.Hour)
 	return b
 }
+
+// arm simulates a staff member having run KLINE <ch> ON.
+func arm(b *Bot, ch string) { b.klineArmed[ch] = time.Now().Add(time.Hour) }
 
 func feed(b *Bot, raw string) { b.dispatch(parseLine(raw)) }
 
@@ -67,6 +72,7 @@ func TestUnknownUsersInsideNetjoinBurstAreTolerated(t *testing.T) {
 // A real clone army: many brand new hosts, no split, no netjoin.
 func TestRealMassJoinStillCaught(t *testing.T) {
 	b := testBot(t)
+	arm(b, "#chatnet")
 	for i := 0; i < 40; i++ {
 		feed(b, fmt.Sprintf(":bot%d!~b@198.51.100.%d JOIN #chatnet", i, i))
 	}
@@ -79,6 +85,7 @@ func TestRealMassJoinStillCaught(t *testing.T) {
 // the first one).
 func TestClonesFromOneHostStillCaught(t *testing.T) {
 	b := testBot(t)
+	arm(b, "#chatnet")
 	for i := 0; i < 40; i++ {
 		feed(b, fmt.Sprintf(":c%d!~c@203.0.113.9 JOIN #chatnet", i))
 	}
@@ -134,12 +141,13 @@ func TestAlreadyInChannelIgnored(t *testing.T) {
 
 func TestInfrastructureNeverActioned(t *testing.T) {
 	b := testBot(t)
+	arm(b, "#chatnet")                           // even when armed, infrastructure is never actioned
 	b.guard.infraIPs = "192.0.2.10,2001:db8::10" // documentation addresses, standing in for the operator's own servers
 	for _, h := range []string{"services.chatnet.gg", "bouncer.chatnet.gg", "172.16.5.9", "172.20.0.2", "10.1.2.3", "127.0.0.1", "chatnet/bot/example", "chatnet/service/example", "192.0.2.10", "2001:db8::10"} {
 		if !isInfraHost(h, b.guard.infraSufx, b.guard.infraIPs) {
 			t.Errorf("%q should count as infrastructure", h)
 		}
-		b.action("x", h, "test")
+		b.action("x", h, "test", "#chatnet")
 	}
 	if len(b.klineQueue) != 0 {
 		t.Fatalf("infrastructure got queued: %d", len(b.klineQueue))
